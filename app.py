@@ -1,6 +1,7 @@
 import asyncio
 import os
 import tempfile
+from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -12,7 +13,6 @@ from pyannote.audio import Pipeline
 MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 GPU_LOCK = asyncio.Lock()
-app = FastAPI()
 
 
 @lru_cache(maxsize=1)
@@ -26,6 +26,17 @@ def _models() -> tuple[WhisperModel, Pipeline]:
     if diarizer is None:
         raise RuntimeError("Unable to load pyannote pipeline")
     return whisper, diarizer.to(torch.device("cuda"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("[startup] Loading Whisper and PyAnnote models...", flush=True)
+    await asyncio.to_thread(_models)
+    print("[startup] Models ready", flush=True)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 def _speaker(start: float, end: float, turns: list[tuple[float, float, str]]) -> str:
