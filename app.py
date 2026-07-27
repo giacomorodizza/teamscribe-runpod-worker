@@ -13,6 +13,7 @@ from pyannote.audio import Pipeline
 MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 GPU_LOCK = asyncio.Lock()
+JOBS: dict[str, dict] = {}
 
 
 @lru_cache(maxsize=1)
@@ -80,17 +81,46 @@ def ping() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...), language: str = Form("it")) -> dict:
+async def _run_job(job_id: str, path: Path, language: str) -> None:
+    try:
+        print(f"[job {job_id[:8]}] Processing started", flush=True)
+        async with GPU_LOCK:
+            JOBS[job_id] = {
+                "status": "completed",
+                "segments": await asyncio.to_thread(_process, path, language),
+            }
+        print(f"[job {job_id[:8]}] Processing completed", flush=True)
+    except Exception as exc:
+        JOBS[job_id] = {"status": "failed", "error": str(exc)}
+        print(f"[job {job_id[:8]}] Failed: {exc}", flush=True)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@app.post("/jobs/{job_id}")
+async def create_job(
+    job_id: str, file: UploadFile = File(...), language: str = Form("it")
+) -> dict:
+    if job_id in JOBS:
+        return {"status": JOBS[job_id]["status"]}
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp:
         temp_path = Path(temp.name)
         while chunk := await file.read(1024 * 1024):
             temp.write(chunk)
-    try:
-        async with GPU_LOCK:
-            return {"segments": await asyncio.to_thread(_process, temp_path, language)}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        temp_path.unlink(missing_ok=True)
+    JOBS[job_id] = {"status": "running"}
+    JOBS[job_id]["task"] = asyncio.create_task(_run_job(job_id, temp_path, language))
+    print(f"[job {job_id[:8]}] Upload accepted", flush=True)
+    return {"status": "running"}
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str) -> dict:
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job["status"] == "completed":
+        return {"status": "completed", "segments": job["segments"]}
+    if job["status"] == "failed":
+        return {"status": "failed", "error": job["error"]}
+    return {"status": "running"}
