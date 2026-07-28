@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from faster_whisper import BatchedInferencePipeline, WhisperModel
+from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 
 from speaker_matching import speaker_for_segment
@@ -62,13 +62,11 @@ def _process(
         for turn, _, label in annotation.itertracks(yield_label=True)
     ]
     started = time.perf_counter()
-    whisper_segments, _ = BatchedInferencePipeline(whisper).transcribe(
+    whisper_segments, _ = whisper.transcribe(
         str(path),
         language=language,
-        without_timestamps=False,
         word_timestamps=True,
         vad_filter=True,
-        batch_size=batch_size,
     )
     output = []
     for segment in whisper_segments:
@@ -140,8 +138,8 @@ async def create_job(
 ) -> dict:
     if num_speakers is not None and num_speakers < 1:
         raise HTTPException(status_code=422, detail="num_speakers must be positive")
-    if not 1 <= batch_size <= 16:
-        raise HTTPException(status_code=422, detail="batch_size must be 1 through 16")
+    if batch_size != 1:
+        raise HTTPException(status_code=422, detail="batch_size must be 1")
     if speaker_gap_seconds < 0:
         raise HTTPException(
             status_code=422, detail="speaker_gap_seconds must be non-negative"
