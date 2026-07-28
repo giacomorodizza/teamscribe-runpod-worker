@@ -1,14 +1,17 @@
 import asyncio
 import os
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from faster_whisper import WhisperModel
+from faster_whisper import BatchedInferencePipeline, WhisperModel
 from pyannote.audio import Pipeline
+
+from speaker_matching import speaker_for_segment
 
 MODEL = os.environ.get("WHISPER_MODEL", "large-v3")
 HF_TOKEN = os.environ.get("HF_TOKEN")
@@ -40,26 +43,31 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def _speaker(start: float, end: float, turns: list[tuple[float, float, str]]) -> str:
-    overlap, label = 0.0, "UNK"
-    for turn_start, turn_end, speaker in turns:
-        value = max(0.0, min(end, turn_end) - max(start, turn_start))
-        if value > overlap:
-            overlap, label = value, speaker
-    return label
-
-
-def _process(path: Path, language: str) -> list[dict]:
+def _process(
+    path: Path,
+    language: str,
+    num_speakers: int | None,
+    batch_size: int,
+    speaker_gap_seconds: float,
+) -> list[dict]:
     whisper, diarizer = _models()
-    diarization = diarizer(str(path))
+    started = time.perf_counter()
+    diarization_kwargs = {"num_speakers": num_speakers} if num_speakers else {}
+    diarization = diarizer(str(path), **diarization_kwargs)
+    diarization_seconds = time.perf_counter() - started
     annotation = getattr(diarization, "speaker_diarization", diarization)
     labels = {label: f"SPK{i}" for i, label in enumerate(sorted(annotation.labels()))}
     turns = [
         (turn.start, turn.end, labels[label])
         for turn, _, label in annotation.itertracks(yield_label=True)
     ]
-    whisper_segments, _ = whisper.transcribe(
-        str(path), language=language, word_timestamps=True, vad_filter=True
+    started = time.perf_counter()
+    whisper_segments, _ = BatchedInferencePipeline(whisper).transcribe(
+        str(path),
+        language=language,
+        word_timestamps=True,
+        vad_filter=True,
+        batch_size=batch_size,
     )
     output = []
     for segment in whisper_segments:
@@ -69,10 +77,18 @@ def _process(path: Path, language: str) -> list[dict]:
                 {
                     "start": segment.start,
                     "end": segment.end,
-                    "speaker": _speaker(segment.start, segment.end, turns),
+                    "speaker": speaker_for_segment(
+                        segment.start, segment.end, turns, speaker_gap_seconds
+                    ),
                     "text": text,
                 }
             )
+    print(
+        f"[metrics] diarization={diarization_seconds:.1f}s "
+        f"whisper={time.perf_counter() - started:.1f}s batch={batch_size} "
+        f"peak_vram={torch.cuda.max_memory_allocated() / 1024**3:.1f}GiB",
+        flush=True,
+    )
     return output
 
 
@@ -81,13 +97,28 @@ def ping() -> dict:
     return {"status": "ok"}
 
 
-async def _run_job(job_id: str, path: Path, language: str) -> None:
+async def _run_job(
+    job_id: str,
+    path: Path,
+    language: str,
+    num_speakers: int | None,
+    batch_size: int,
+    speaker_gap_seconds: float,
+) -> None:
     try:
         print(f"[job {job_id[:8]}] Processing started", flush=True)
         async with GPU_LOCK:
+            torch.cuda.reset_peak_memory_stats()
             JOBS[job_id] = {
                 "status": "completed",
-                "segments": await asyncio.to_thread(_process, path, language),
+                "segments": await asyncio.to_thread(
+                    _process,
+                    path,
+                    language,
+                    num_speakers,
+                    batch_size,
+                    speaker_gap_seconds,
+                ),
             }
         print(f"[job {job_id[:8]}] Processing completed", flush=True)
     except Exception as exc:
@@ -99,8 +130,21 @@ async def _run_job(job_id: str, path: Path, language: str) -> None:
 
 @app.post("/jobs/{job_id}")
 async def create_job(
-    job_id: str, file: UploadFile = File(...), language: str = Form("it")
+    job_id: str,
+    file: UploadFile = File(...),
+    language: str = Form("it"),
+    num_speakers: int | None = Form(None),
+    batch_size: int = Form(8),
+    speaker_gap_seconds: float = Form(1.0),
 ) -> dict:
+    if num_speakers is not None and num_speakers < 1:
+        raise HTTPException(status_code=422, detail="num_speakers must be positive")
+    if not 1 <= batch_size <= 16:
+        raise HTTPException(status_code=422, detail="batch_size must be 1 through 16")
+    if speaker_gap_seconds < 0:
+        raise HTTPException(
+            status_code=422, detail="speaker_gap_seconds must be non-negative"
+        )
     if job_id in JOBS:
         return {"status": JOBS[job_id]["status"]}
     suffix = Path(file.filename or "audio.ogg").suffix or ".ogg"
@@ -109,7 +153,16 @@ async def create_job(
         while chunk := await file.read(1024 * 1024):
             temp.write(chunk)
     JOBS[job_id] = {"status": "running"}
-    JOBS[job_id]["task"] = asyncio.create_task(_run_job(job_id, temp_path, language))
+    JOBS[job_id]["task"] = asyncio.create_task(
+        _run_job(
+            job_id,
+            temp_path,
+            language,
+            num_speakers,
+            batch_size,
+            speaker_gap_seconds,
+        )
+    )
     print(f"[job {job_id[:8]}] Upload accepted", flush=True)
     return {"status": "running"}
 
