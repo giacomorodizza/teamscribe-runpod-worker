@@ -1,6 +1,6 @@
 # TeamScribe RunPod worker
 
-RunPod Load Balancing worker: Faster-Whisper `large-v3` + PyAnnote Community-1 speaker diarization.
+RunPod Load Balancing worker: Faster-Whisper `large-v3` + PyAnnote speaker diarization 3.1.
 
 Set RunPod environment variables `HF_TOKEN` and `WHISPER_MODEL=large-v3`. Configure port `80` and health path `/ping`.
 
