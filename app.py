@@ -25,7 +25,7 @@ def _models() -> tuple[WhisperModel, Pipeline]:
         raise RuntimeError("HF_TOKEN is required")
     whisper = WhisperModel(MODEL, device="cuda", compute_type="float16")
     diarizer = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", **{"use_auth_token": HF_TOKEN}
+        "pyannote/speaker-diarization-community-1", token=HF_TOKEN
     )
     if diarizer is None:
         raise RuntimeError("Unable to load pyannote pipeline")
