@@ -65,6 +65,7 @@ def _process(
     whisper_segments, _ = BatchedInferencePipeline(whisper).transcribe(
         str(path),
         language=language,
+        without_timestamps=False,
         word_timestamps=True,
         vad_filter=True,
         batch_size=batch_size,
